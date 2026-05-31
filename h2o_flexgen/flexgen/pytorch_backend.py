@@ -525,13 +525,14 @@ class TorchDevice:
             # print(attn_weights.shape)
             attn_weights = attn_weights.squeeze(1).transpose(0, 1)
             # (s, b * n_head)
-            acc.data = acc.data.cuda()
-            acc.data[-1] = 0
-            acc.data = acc.data + attn_weights
+            _acc = acc.data[:src_s].cuda()
+            _acc[-1] = 0
+            _acc += attn_weights
+            acc.data[:src_s] = _acc
             # print("acc.data", acc.data.shape, acc.data[:, -4])
             kick_ind = self._get_light_hitter(acc.data[:src_s - hh_k, :])
             if not k.is_cuda:
-                acc.data = acc.data.float().cpu()
+                acc.data[:src_s] = _acc.float().cpu()
             # kick_ind = self._get_light_hitter(acc.data[:src_s - hh_k + 1, :])
 
         return TorchTensor.create_from_torch(value, self), k_new, v_new, acc, kick_ind
@@ -697,7 +698,27 @@ class TorchDevice:
 
         out = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
         out = F.linear(out, wi.data, bias=bi.data)
+        
+        # --- Contextual Sparsity (Top-K Router based on pre-activations) ---
+        top_k = int(os.environ.get("MLP_TOP_K", "8192")) # 512->21.12 256->21.25 128->29.05 64->52.41 32->134.62 16->10816 3->?
+        _, topk_indices = torch.topk(out, k=top_k, dim=-1)
+        mask = torch.zeros_like(out)
+        mask.scatter_(dim=-1, index=topk_indices, value=1.0)
+        
+        # Load Balancing Auxiliary Loss
+        router_probs = F.softmax(out, dim=-1)
+        f_i = mask.float().mean(dim=(0, 1))
+        p_i = router_probs.mean(dim=(0, 1))
+        lb_loss = out.shape[-1] * (f_i * p_i).sum() * 1e-2
+        
+        if not hasattr(self, 'mlp_aux_loss'):
+            self.mlp_aux_loss = 0.0
+        self.mlp_aux_loss += lb_loss.item()
+        
+        # Apply mask and Activation
         F.relu(out, inplace=True)
+        out = out * mask
+        
         out = F.linear(out, wo.data, bias=bo.data)
 
         out.add_(inputs.data)

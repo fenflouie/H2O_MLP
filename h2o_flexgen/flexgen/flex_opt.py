@@ -1227,6 +1227,94 @@ class OptLM:
             else:
                 timers("generate").costs.append(self.num_layers * batch_cost)
 
+    def get_logits(self, inputs: Union[np.array, List[List[int]]]):
+        total_seq_len = len(inputs[0])
+        prompt_len = total_seq_len // 2  # Evaluate first half as dense prefill, second half autoregressive
+        gen_len = total_seq_len - prompt_len + 1
+        
+        task = Task(
+            inputs=inputs[:, :prompt_len],
+            prompt_len=prompt_len,
+            gen_len=gen_len,
+            cut_gen_len=None,
+            do_sample=False,
+            temperature=1.0,
+            stop=None,
+        )
+        self.set_task(task)
+        num_layers = self.num_layers
+        num_gpu_batches = self.num_gpu_batches
+        self.execute_gen_len = gen_len
+        
+        self.output_ids = np.zeros((len(inputs), total_seq_len + 1), dtype=np.int32)
+        self.output_ids[:, :total_seq_len] = np.asarray(inputs)
+        
+        for j in range(num_layers):
+            for k in range(num_gpu_batches):
+                self.cache_home[j][k].clear()
+                self.cache_read_buf[j][k].clear()
+                self.cache_write_buf[j][k].clear()
+        for j in range(num_layers):
+            self.weight_read_buf[j].clear()
+        for k in range(num_gpu_batches):
+            self.attention_mask[k].clear()
+        self.hidden = array_3d(self.execute_gen_len, num_layers, num_gpu_batches, ValueHolder)
+
+        for j in range(num_layers):
+            for k in range(num_gpu_batches):
+                self.init_cache(j, k)
+        if self.policy.cpu_cache_compute:
+            self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy, self.hh_k)
+
+        all_logits = []
+        for i in range(self.execute_gen_len):
+            for k in range(num_gpu_batches):
+                self.update_attention_mask(i, k)
+            
+            for j in range(num_layers - 1):
+                for k in range(num_gpu_batches):
+                    self.load_weight(i, j, k, overlap=False)
+                for k in range(num_gpu_batches):
+                    self.load_cache(i, j, k, overlap=False)
+                    self.load_hidden(i, j, k)
+                    self.compute_layer(i, j, k)
+                    self.store_hidden(i, j, k)
+                    self.store_cache(i, j, k, overlap=False)
+
+            j = num_layers - 1
+            step_logits = [None] * num_gpu_batches
+            for k in range(num_gpu_batches):
+                self.load_weight(i, j, k, overlap=False)
+                self.load_hidden(i, j, k)
+                
+                if k == self.policy.num_gpu_batches - 1:
+                    (w_ln, _), (b_ln, _), (w_token, _) = self.weight_read_buf[j].pop()
+                else:
+                    (w_ln, _), (b_ln, _), (w_token, _) = self.weight_read_buf[j].val
+
+                hidden_tensor = self.hidden[i][j][k].val.data
+                
+                import torch.nn.functional as F
+                w_token_tensor = w_token.data
+                if w_token.device.device_type == DeviceType.COMPRESSED:
+                    w_token_tensor = w_token.device.decompress(w_token).data
+
+                hidden_data = F.layer_norm(hidden_tensor, (self.config.input_dim,), weight=w_ln.data, bias=b_ln.data)
+                out_logits = F.linear(hidden_data, w_token_tensor)
+                step_logits[k] = out_logits.cpu()
+                
+                self.hidden[i][j][k].pop().delete()
+
+            all_logits.append(torch.cat(step_logits, dim=0))
+
+        for j in range(num_layers):
+            for k in range(num_gpu_batches):
+                self.delete_cache(j, k)
+        if self.policy.cpu_cache_compute:
+            self.env.cpu.del_attention_compute_workspace()
+
+        return torch.cat(all_logits, dim=1)
+
     def __del__(self):
         self.delete_all_weights()
 
